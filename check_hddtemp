@@ -1,0 +1,73 @@
+#!/bin/perl
+# Nagios plugin to get the temperatue of HDDs, calling the hddtemp daemon
+# Author: Andrej Pakhutin
+# http://github.com/kadavris/nagios-plugins
+# License: see accompanying LICENSE file
+# 2014-05-16: by Andrej Pakhutin
+#  Switched to communication with daemon instead of calling hddtemp each time
+#  This prevents issues with root access
+#  uses ncat from nmap package
+
+use strict;
+use warnings;
+
+my $ret_ok = 0;
+my $ret_warning = 1;
+my $ret_critical = 2;
+my $ret_unknown = 3;
+
+my $port = 7634;
+
+##########################################
+# init
+$#ARGV != 2 and exit_on_problem("Usage: check_hddtemp <device> <warn> <crit>\n");
+
+my $device = $ARGV[0];
+my $warn = $ARGV[1];
+my $crit = $ARGV[2];
+
+-b $device or exit_on_problem("UNKNOWN: $device is not a block special file\n");
+$warn > $crit and exit_on_problem("UNKNOWN: WARN value may not be greater than or equal the CRIT value\n");
+
+# daemon output is as follows:
+# |dev1|dev1serial|dev1temp|C|<empty here>|dev2...
+open T, "/bin/ncat -i 1 -w 1 127.0.0.1 $port 2>/dev/null |" or exit_on_problem("UNKNOWN: ncat: $!\n");
+my $daemon_answer = <T>;
+close T;
+
+my %devlist;
+my @tmp = split /\|/, $daemon_answer;
+for (my $i = 1; $i < $#tmp; )
+{
+  $devlist{$tmp[$i]} = $tmp[$i + 2];
+  $i += 5;
+}
+
+my $heat = $devlist{$device};
+defined($heat) or exit_on_problem("UNKNOWN: daemon has no knowledge of $device\n");
+
+if ( $heat < $warn )
+{
+  print "OK: Temperature is below warn treshold ($device is $heat)\n";
+  exit $ret_ok;
+}
+elsif ( $heat < $crit )
+{
+  print "WARNING: Temperature is above warn treshold ($device is $heat)\n";
+  exit $ret_warning;
+}
+elsif ( $heat >= $crit )
+{
+  print "CRITICAL: Temperature is above crit treshold ($device is $heat)\n";
+  exit $ret_critical;
+}
+
+print "UNKNOWN: This error message should never occur, if it does happen anyway, get a new cup of coffee and fix the code :)\n";
+exit $ret_unknown;
+
+##########################################
+sub exit_on_problem
+{
+  print $_[0], "args: ", join(' ', @ARGV), "\nDaemon answer is: $daemon_answer\n";
+  exit $ret_unknown;
+}

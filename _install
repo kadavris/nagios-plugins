@@ -1,0 +1,15 @@
+#!/bin/sh
+
+if [ `/bin/id -un` != root ];
+then
+  sudo $0
+  exit
+fi
+
+outpath=/usr/lib/nagios/plugins/contrib
+for pl in check_dir check_hddtemp check_md_raid
+do
+  /bin/cp -v "$pl" "$outpath/"
+  /bin/chown nagios:nagios "$outpath/$pl"
+  /bin/chmod ug=rx,o-rwx "$outpath/$pl"
+done

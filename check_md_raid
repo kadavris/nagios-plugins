@@ -1,0 +1,358 @@
+#!/bin/perl
+# MD raid Nagios plugin
+# Author: Andrej Pakhutin
+# http://github.com/kadavris/nagios-plugins
+# License: see accompanying LICENSE file
+# 2018-11-21: initial version
+# 2020-01-05: added sync_completed process reporting
+
+use warnings;
+use strict;
+use Getopt::Long;
+use POSIX qw(round trunc);
+
+my $vfs_base = '/sys/block';
+
+my $debug = 0;
+my $verboseness = 1; # 0-9. how much details to show. amt of output depends on status providers
+
+my $status_ok = 0;
+my $status_warning = 1;
+my $status_critical = 2;
+my $status_unknown = 3;
+my %status_weight = ( $status_ok => 0, $status_unknown => 1, $status_warning => 80, $status_critical => 99 );
+
+my ( @arrays );
+my $cmd_line = '  ARGV: ( ' . join( '!', @ARGV ) . ' )'; # for debug
+
+GetOptions(
+  'd=i' => \$debug,
+  'v=i' => \$verboseness,
+);
+
+$#ARGV < 0 and help();
+
+my $status_code = $status_ok;
+my $status_msg = '';
+
+for my $argv ( @ARGV )
+{
+  $status_msg ne '' and $status_msg = ' | ' . $status_msg;
+  process_array( $argv );
+}
+
+print $status_msg, "\n";
+
+exit( $status_code );
+
+##########################################
+# main routine to stat with md array analysis
+# in: <path>
+sub process_array
+{
+  my $path = $_[0];
+  my $dev_name = $path;
+
+  $debug and print "---- $path\n";
+
+  if ( $path !~ /\// )
+  {
+    $path = $vfs_base . '/' . $path;
+  }
+  else
+  {
+    $dev_name =~ s/^.+\///;
+  }
+
+  $status_msg .= $dev_name . ': ';
+
+  if ( ! -d $path )
+  {
+    set_state( $status_unknown, ' Invalid path!' );
+    return;
+  }
+
+  my $res; # get_file,etc output. re-usable
+
+  if ( $verboseness > 4 )
+  {
+    # now get to the business. gathering main parameters:
+    $res = get_file( $dev_name, $path . '/size' );
+    $res->[0] != 0 and return;
+    $status_msg .= nice_size( int( $res->[1] ) / 2 ); # 512 byte sectors
+  }
+
+  $path .= '/md';
+
+  $res = get_file( $dev_name, $path . '/level' );
+  $res->[0] != 0 and return;
+  my $level = $res->[1]; #'raid\d+'
+
+  if ( $verboseness > 4 )
+  {
+    $status_msg .= ' ' . $level . ':';
+  }
+
+  # getting disks number
+  $res = get_file( $dev_name, $path . '/raid_disks' );
+  $res->[0] != 0 and return;
+  my $disks = int( $res->[1] );
+
+  # ---- health checks begin here ----
+  $res = check_val_list( $dev_name, $path . '/sync_action', [ 'idle', 'check' ], [ 'resync' ], [] );
+  $res->[0] != 0 and set_state( $res->[0], 'sync_action: ' . $res->[1] );
+
+  if ( $res->[1] ne 'idle' )
+  {
+    $res = get_file( $dev_name, $path . '/sync_completed' );
+
+    if ( $res->[0] > 0 || $verboseness > 2 )
+    {
+      my @c = split( /\s+/, $res->[1] );
+      $status_msg .= sprintf( ', %02.1f%% of check completed', $c[0] / ( $c[2] / 100 ) );
+    }
+  }
+
+  ####
+  $res = check_val_less_than( $dev_name, $path . '/degraded', 1, 2 ); # 0/1
+  $res->[0] != 0 and set_state( $res->[0], 'DEGRADED' );
+
+  ####
+  $res = check_val_list( $dev_name, $path . '/array_state', [ 'active', 'active-idle', 'clean', 'write-pending' ], [ 'resyncing', 'recovering', 'Not Started' ], [ '', 'degraded' ]);
+  if ( $res->[0] != 0 )
+  {
+    set_state( $res->[0], 'array_state: ' . $res->[1] );
+  }
+  else
+  {
+    $status_msg .= ' ' . ( $verboseness > 4 ? $res->[1] : 'OK' ); # showing OK state too
+  }
+
+  ####
+  $verboseness > 8 and $status_msg .= state3( $res->[0], ' ;)', ' :|', ' 8()' );
+
+  #suspend_hi: 0
+  #rmw_level: 1
+  #sync_force_parallel: 0
+  #layout: 2
+  #safe_mode_delay: 0.201
+  #reshape_position: none
+  #resync_start: none
+  #mismatch_cnt: 0
+  #last_sync_action: check
+  #sync_completed: none
+  #reshape_direction: forwards
+  #suspend_lo: 0
+  #preread_bypass_threshold: 1
+  #group_thread_cnt: 0
+  #metadata_version: 1.2
+
+  ####
+  my $disks_status = '';
+
+  for my $disk ( 0..($disks - 1) )
+  {
+    my( $code, $msg ) = check_disk( $dev_name, $path . '/rd' . $disk );
+
+    if ( $msg ne '' || $verboseness > 5 )
+    {
+      $disks_status .= $disk . '-' . $msg;
+      $disk < $disks -1 and $disks_status .= ', ';
+    }
+  }
+
+  $disks_status ne '' and $status_msg .= ', drives: [' . $disks_status . ']';
+}
+
+##########################################
+# check the values from one of the disks
+# in: dev, path
+# out: none
+sub check_disk
+{
+  my @out = ($status_code, ''); # status code, message
+
+  my $res = check_val_list( $_[0], $_[1] . '/state', [ 'in_sync' ], [ '???' ], [ '???' ]  );
+  $out[0] = state_max( $res->[0], $out[0] );
+  $out[1] .= state3( $res->[0], $verboseness >= 5 ? $res->[1] : '', $res->[1] . '? ', $res->[1] . '! ' );
+
+  $res = check_val_less_than( $_[0], $_[1] . '/bad_blocks', 10, 30 );
+  $out[0] = state_max( $res->[0], $out[0] );
+  $out[1] .= state3( $res->[0], '', ' BadBlk', ' BadBlk(' . $res->[1] . ')' );
+
+  $res = check_val_less_than( $_[0], $_[1] . '/unacknowledged_bad_blocks', 10, 30 );
+  $out[0] = state_max( $res->[0], $out[0] );
+  $out[1] .= state3( $res->[0], '', ' bad?', ' bad? blk(' . $res->[1] . ')' );
+
+  $res = check_val_less_than( $_[0], $_[1] . '/errors', 5, 10 );
+  $out[0] = state_max( $res->[0], $out[0] );
+  $out[1] .= state3( $res->[0], '', ' Err!', ' Errs!(' . $res->[1] . ')' );
+
+  $res = check_val_list( $_[0], $_[1] . '/recovery_start', [ 'none' ], [ '???' ], [ '???' ]  );
+  $out[0] = state_max( $res->[0], $out[0] );
+  $out[1] .= state3( $res->[0], '', '/recv start: warn', '/recv start: crit' );
+
+  #ppl_size: 0
+  #offset: 262144
+  #size: 2878419968
+  #new_offset: 262144
+  #ppl_sector: 0
+
+  return @out;
+}
+
+##########################################
+# quick check the value from one-liner files: ok < warn < crit
+# in: dev, path, warn value, crit value
+# out: [status_code, val|err]
+sub check_val_less_than
+{
+  my $res = get_file( $_[0], $_[1] );
+  $res->[0] != 0 and return $res;
+
+  ( $res->[1] eq '' || $res->[1] <= $_[2] ) and return [ $status_ok, $res->[1] ];
+
+  $res->[1] <= $_[3] and return [ $status_warning, $res->[1] ];
+
+  return [ $status_critical, $res->[1] ];
+}
+
+##########################################
+# quick check the value from one-liner files: crit < warn < ok
+# in: dev, path, warn value, crit value
+# out: [status_code, err]
+sub check_val_more_than
+{
+  my $res = get_file( $_[0], $_[1] );
+  $res->[0] != 0 and return $res;
+
+  ( $res->[1] eq '' || $res->[1] >= $_[2] ) and return [ $status_ok, $res->[1] ];
+
+  $res->[1] >= $_[3] and return [ $status_warning, $res->[1] ];
+
+  return [ $status_critical, $res->[1] ];
+}
+
+##########################################
+# quick check the value from one-liner/one-word files: with explicit value lists
+# in: dev, path, [good values], [warn values], [crit values]
+# out: [status_code, err]
+sub check_val_list
+{
+  my $res = get_file( $_[0], $_[1] );
+  $res->[0] != 0 and return $res;
+
+  my $idx = 2; # index in args
+
+  for my $state ( ( $status_ok, $status_warning, $status_critical ) )
+  {
+    for my $v ( @{ $_[ $idx ] } )
+    {
+      lc( $res->[1] ) eq lc( $v ) and return [ $state, $v ];
+    }
+
+    ++$idx;
+  }
+
+  set_state( $status_unknown, ' ! Unknown state (' . $res->[1] . ') read from ' . $_[1] . ' !' );
+
+  return [ $status_unknown, '' ];
+}
+
+##########################################
+# in: dev, path
+# out: [ > 0 if ERR state, content of file or error message ]
+sub get_file
+{
+  if ( ! open F, '<', $_[1] )
+  {
+    set_state( $status_unknown, " !!! file $_[1]: $! !!!" );
+    return [ -1, '' ];
+  }
+
+  my $c = [ 0 ];
+
+  $debug > 9 and print "+ get_file ($_[0], $_[1]): \n";
+
+  while( <F> )
+  {
+    $debug > 9 and print '      ', $_;
+    chomp;
+    push @{ $c }, $_;
+  }
+
+  close F;
+
+  $#{ $c } == 0 and $c->[1] = '';
+
+  return $c;
+}
+
+##########################################
+# return the worse code of two supplied
+# in:  code1,code2
+# out: worse code
+sub state_max
+{
+  return $_[1] if $status_weight{ $_[0] } < $status_weight{ $_[1] };
+  return $_[0];
+}
+
+##########################################
+# sets current status to the most critical of old and new ones
+# in: new code, ok_msg, warn_msg, crit_msg
+# out: none
+sub state3
+{
+  $status_code = state_max( $_[0], $status_code );
+
+  return $_[0] == $status_ok ? $_[1] : $_[0] == $status_warning ? $_[2] : $_[3];
+}
+
+
+##########################################
+# sets current status to the most critical of old and new ones
+# in: new code, out: none
+sub set_state
+{
+  return if $status_weight{ $status_code } >= $status_weight{ $_[0] };
+  $status_code = $_[0];
+  $status_msg .= ' ' . $_[1];
+}
+
+##########################################
+sub nice_size
+{
+  my $s = $_[0];
+  my $div = 1024 * 1024 * 1024;
+  my @n = qw( Tb Gb Mb );
+
+  for my $suff ( @n )
+  {
+    if ( $s / $div < 1 )
+    {
+      $div /= 1024;
+      next;
+    }
+
+    return round($s / $div) . ' ' . $suff;
+  }
+
+  return round($s / $div) . ' Kb';
+}
+
+##########################################
+sub exit_on_problem
+{
+  print $_[0], "args: ", join(' ', @ARGV), "\n";
+  exit $status_unknown;
+}
+
+##########################################
+sub help
+{
+  print "This Nagios plugin monitors the state of several MD raids via /sys/block vfs interface\n";
+  print "Use: [-d] [-v <verboseness level 0-9>] <path1>[ <path2>...]\n\t-d - debug\n";
+  print "You may specify device name with or without the full path\n";
+  exit $status_unknown;
+}

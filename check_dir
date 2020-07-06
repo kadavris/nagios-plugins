@@ -1,0 +1,309 @@
+#!/bin/perl
+# This Nagios plugin can check the provided sub-tree size and age
+# It can be used as a standalone tool via cron when additional permissions required.
+# Author: Andrej Pakhutin
+# http://github.com/kadavris/nagios-plugins
+# License: see accompanying LICENSE file
+# 2019-03-25: AP: added email reporting and logging
+# 2018-11-21: AP: initial version
+
+use warnings;
+use strict;
+use Getopt::Long;
+use POSIX qw(round trunc);
+
+my $version = '2.0';
+my $debug = 0;
+
+my $ret_ok       = 0;
+my $ret_warning  = 1;
+my $ret_critical = 2;
+my $ret_unknown  = 3;
+
+my ( $size_arg, $age_arg, $size_warn, $size_crit, $age_warn, $age_crit, $email, $log );
+
+my $cmd_line = '  ARGV: ( ' . join('!',@ARGV) . ' )';
+
+GetOptions(
+  'a=s' => \$age_arg,
+  'd=i' => \$debug,
+  'e=s' => \$email,
+  'l=s' => \$log,
+  's=s' => \$size_arg,
+);
+
+if ( ! defined( $size_arg ) && ! defined( $age_arg ) )
+{
+  help();
+}
+
+my $ret_code = $ret_ok;
+my $ret_msg = '';
+my $total_used = 0;
+
+init_limits();
+
+for my $path ( @ARGV )
+{
+  if ( ! -d $path )
+  {
+    print 'Invalid path: ', $path, "\n";
+    exit( $ret_unknown );
+  }
+
+  $debug and print "---- $path\n";
+
+  # we'll request a total size with df util. FS full size goes handy too
+  open I, qq~/bin/df -k "$path" |~ or exit_on_problem( "df: $!" );
+  $_ = <I>; $debug and print '+ du: ', $_;
+  $_ = <I>; $debug and print '+ du: ', $_;
+  chomp;
+  close I;
+
+  #Filesystem                 1K-blocks     Used Available Use% Mounted on
+  /^\S+\s+(\d+)\s+(\d+)\s+(\d+)\s+\S+\s+(.+)/;
+  my $fs_size = $1;
+  my $fs_used = $2;
+  my $fs_free = $3;
+  my $fs_mnt  = $4;
+
+  normalize_size( $size_warn, $fs_size );
+  normalize_size( $size_crit, $fs_size );
+
+  my $used = 0; # used size for this path
+
+  # now we scan for size/age problems
+  if ( $age_crit <= 0 && $age_warn <= 0 ) # no age check. good - use fast algo
+  {
+    open I, '/bin/du -s -k "' . $path . '" |' or exit_on_problem( "du: $!" );
+    $_ = <I>;
+    close I;
+
+    $debug > 5 and print '+du: ', $_;
+
+    s/\s+.*//;
+
+    $used = int( $_ );
+  }
+
+  else # age check requested. using manual labor
+  {
+    open I, '/bin/find "' . $path . '" -printf \'%y %k %T@ %p\n\' |' or exit_on_problem( "find: $!" );
+
+    while( <I> ) # counting total size and checking for aged files if requested
+    {
+      $debug > 5 and print '+', $_;
+
+      chomp;
+
+      /^(.)\s+(\d+)\s+(\d+)\.\d+\s+(.+)$/;
+      my $ftype = $1;
+      my $ftime = int($3);
+      my $fname = $4;
+
+      $ftype eq 'f' and $used += int($2);
+
+      next if ( $ftype ne 'f' || $ret_code > $ret_ok ); # only files are checked for age
+
+      if ( $ftime < $age_crit )
+      {
+        $ret_code = $ret_critical;
+        $ret_msg .= 'CRITICAL: "' . $fname . '" mtime is ' . to_days($age_crit) . ' days old... ';
+      }
+      elsif ( $age_warn > 0 && $ftime < $age_warn )
+      {
+        $ret_code = $ret_warning;
+        $ret_msg .= 'WARNING: "' . $fname . '" mtime is ' . to_days($age_warn) . ' days old... ';
+      }
+    }
+
+    close I;
+  }
+
+  $total_used += $used;
+
+  $debug and print "+ Used: ", nice_size( $used ), ", crit size: ", nice_size( $size_crit ), ", warn size: ", nice_size( $size_warn ), "\n";
+
+  if ( defined( $size_arg ) )
+  {
+    if ( $used >= $size_crit )
+    {
+      $ret_code = $ret_critical;
+      $ret_msg .= 'CRIT: "' . $path . '" size is ' . nice_size( $used ) . ' ... ';
+    }
+    elsif ( $size_warn > -1 && $used >= $size_warn )
+    {
+      $ret_code = $ret_warning;
+      $ret_msg .= 'WARN: "' . $path . '" size is ' . nice_size( $used ) . ' ... ';
+    }
+  }
+} # for $path
+
+$ret_msg eq '' and $ret_msg = 'OK: Size: ' . nice_size( $total_used );# . $cmd_line;
+
+do_report( $ret_msg, $ret_code );
+
+##########################################
+##########################################
+# initializes limit-defining variables from provided argumants
+sub init_limits
+{
+  if ( defined( $size_arg ) )
+  {
+    $size_arg = lc( $size_arg );
+    $size_arg =~ /^(\d+[kmg%]?)(,(\d+[kmg%]?))$/ or help();
+
+    if ( defined( $2 ) ) # has warn value
+    {
+      $size_warn = $1;
+      $size_crit = $3;
+    }
+    else
+    {
+      $size_warn = -1;
+      $size_crit = $1;
+    }
+  }
+  else
+  {
+    $size_warn = $size_crit = -1;
+  }
+
+  if ( defined ( $age_arg ) )
+  {
+    $age_arg = lc( $age_arg );
+    $age_arg =~ /^(\d+)([dmy])?,?(\d+)([dmy])?$/ or help();
+
+    if ( defined( $3 ) ) # has warn value
+    {
+      $age_warn = to_ts( $1, defined( $2 ) ? $2 : 'd' );
+      $age_crit = to_ts( $3, defined( $4 ) ? $4 : 'd' );
+    }
+    else
+    {
+      $age_warn = -1;
+      $age_crit = to_ts( $1, defined( $2 ) ? $2 : 'd' );
+    }
+  }
+  else
+  {
+    $age_warn = $age_crit = -1;
+  }
+}
+
+##########################################
+# in: human-readable string, exit value
+sub do_report
+{
+  if ( ! defined( $email ) )
+  {
+    print $_[0], "\n";
+  }
+  elsif( $_[1] != $ret_ok ) # we don't nag with "all is OK" messages
+  {
+    my $host = `/bin/hostname`;
+    chomp $host;
+    open M, '| /bin/mail -r "check_dir@' . $host . '" -s "' . $_[0] . '" "' . $email . '"' or die "/bin/mail: $!";
+    print M "$_[0]\n";
+    close M;
+  }
+
+  do_log( $_[0] );
+
+  exit( $_[1] );
+}
+
+##########################################
+# writes args to log
+sub do_log
+{
+  return if ! defined( $log );
+
+  open L, '>>', $log or print STDERR "$log: $!";
+  my ($sec, $min, $hour, $mday, $mon, $year, $wday, $yday, $isdst) = localtime(time); $year += 1900; ++$mon;
+  print L "$year-$mon-$mday $hour:$min:$sec ", join( ' ', @_ ), "\n";
+  close L;
+}
+
+##########################################
+# in: size value in Kb
+# out: human-readable form
+sub nice_size
+{
+  my $s = $_[0];
+  my $div = 1_073_741_824; # start with 1 Tb
+  my @n = qw( Tb Gb Mb );
+
+  for my $suff ( @n )
+  {
+    if ( $s / $div < 1 )
+    {
+      $div /= 1024;
+      next;
+    }
+
+    return round( $s / $div ) . ' ' . $suff;
+  }
+
+  return round( $s / $div ) . ' Kb';
+}
+
+##########################################
+# will convert warn/crit size value provided by human to Kb
+# in: option value, filesystem size (for % suffix)
+# out: value in Kb ($_[0] by reference!)
+sub normalize_size
+{
+  $_[0] =~ /^(\d+)([kmgt%])?$/i or return;
+  return if ! defined ( $2 );
+  my $s = int( $1 );
+  my $e = lc( $2 );
+
+  $e eq '%' and $_[0] = $_[1] / 100.0 * $s;
+  $e eq 'm' and $_[0] = $s * 1024;
+  $e eq 'g' and $_[0] = $s * 1_048_576;
+  $e eq 't' and $_[0] = $s * 1_073_741_824;
+  #wait...wait!...WAIT!!!!...1_099_511_627_776
+}
+
+##########################################
+# in: timestamp
+# out: full days elepsed since
+sub to_days
+{
+  return round( (time - $_[0]) / 3600 / 24 );
+}
+
+##########################################
+# in: human-readable amount of d/m/y
+# out: timestamp
+sub to_ts
+{
+  my $ts;
+  $_[1] eq 'd' and $ts = int( $_[0] );
+  $_[1] eq 'm' and $ts = int( $_[0] ) * 30;
+  $_[1] eq 'y' and $ts = int( $_[0] ) * 365;
+  return time - $ts * 24 * 3600;
+}
+
+##########################################
+sub exit_on_problem
+{
+  print $_[0], "args: ", join(' ', @ARGV), "\n";
+  exit $ret_unknown;
+}
+
+##########################################
+sub help
+{
+  print 'Nagios plugin/standalone tool for controlling the size of given directories. V', $version, q~
+Use: {-s <[warn_size,]crit_size> | -a <[warn_age,]crit_age..>} [-e <email to send report>] [-l <log file>] <path1>...<pathN>
+    For -s option the default size is in Kb.
+        % suffix means percentage of _total_ volume size which is determined by /bin/df
+        Other shortcut suffixes are: m,g,t for mega,giga,tera...
+    For -a default is days
+        Shortcut suffixes are d - days, m - months, y - years
+uses output from df, du and find utilities
+~;
+  exit $ret_unknown;
+}
