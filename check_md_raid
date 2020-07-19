@@ -99,7 +99,7 @@ sub process_array
   my $disks = int( $res->[1] );
 
   # ---- health checks begin here ----
-  $res = check_val_list( $dev_name, $path . '/sync_action', [ 'idle', 'check' ], [ 'resync' ], [] );
+  $res = check_val_list( $dev_name, $path . '/sync_action', [ 'idle', 'check' ], [ 'resync', 'recover' ], [] );
   $res->[0] != 0 and set_state( $res->[0], 'sync_action: ' . $res->[1] );
 
   if ( $res->[1] ne 'idle' )
@@ -171,27 +171,39 @@ sub process_array
 sub check_disk
 {
   my @out = ($status_code, ''); # status code, message
+  my ( $dev, $path ) = @_;
 
-  my $res = check_val_list( $_[0], $_[1] . '/state', [ 'in_sync' ], [ '???' ], [ '???' ]  );
+  if ( ! -r $path )
+  {
+    return ( $status_critical, 'Drive ' . substr( $path, -1, 1 ) . ' is missing/faulty' );
+  }
+
+  my $res = check_val_list( $dev, $path . '/state', [ 'in_sync' ], [ '???' ], [ '???' ]  );
   $out[0] = state_max( $res->[0], $out[0] );
   $out[1] .= state3( $res->[0], $verboseness >= 5 ? $res->[1] : '', $res->[1] . '? ', $res->[1] . '! ' );
 
-  $res = check_val_less_than( $_[0], $_[1] . '/bad_blocks', 10, 30 );
+  $res = check_val_less_than( $dev, $path . '/bad_blocks', 10, 30 );
   $out[0] = state_max( $res->[0], $out[0] );
   $out[1] .= state3( $res->[0], '', ' BadBlk', ' BadBlk(' . $res->[1] . ')' );
 
-  $res = check_val_less_than( $_[0], $_[1] . '/unacknowledged_bad_blocks', 10, 30 );
+  $res = check_val_less_than( $dev, $path . '/unacknowledged_bad_blocks', 10, 30 );
   $out[0] = state_max( $res->[0], $out[0] );
   $out[1] .= state3( $res->[0], '', ' bad?', ' bad? blk(' . $res->[1] . ')' );
 
-  $res = check_val_less_than( $_[0], $_[1] . '/errors', 5, 10 );
+  $res = check_val_less_than( $dev, $path . '/errors', 5, 10 );
   $out[0] = state_max( $res->[0], $out[0] );
   $out[1] .= state3( $res->[0], '', ' Err!', ' Errs!(' . $res->[1] . ')' );
 
-  $res = check_val_list( $_[0], $_[1] . '/recovery_start', [ 'none' ], [ '???' ], [ '???' ]  );
-  $out[0] = state_max( $res->[0], $out[0] );
-  $out[1] .= state3( $res->[0], '', '/recv start: warn', '/recv start: crit' );
-
+  $res = get_file( $dev, $path . '/recovery_start' );
+  if ( $res->[1] eq 'none' )
+  {
+    $out[0] = state_max( $status_ok, $out[0] );
+  }
+  else # some kind of number: sector?
+  {
+    $out[0] = state_max( $status_warning, $out[0] );
+    $out[1] .= '/recovery(' . $res->[1] . ')';
+  }
   #ppl_size: 0
   #offset: 262144
   #size: 2878419968
@@ -312,7 +324,8 @@ sub state3
 
 ##########################################
 # sets current status to the most critical of old and new ones
-# in: new code, out: none
+# in: new code, msg
+# out: none
 sub set_state
 {
   return if $status_weight{ $status_code } >= $status_weight{ $_[0] };
