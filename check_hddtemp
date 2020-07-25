@@ -44,9 +44,14 @@ for (my $i = 1; $i < $#tmp; )
 }
 
 my $heat = $devlist{$device};
-defined($heat) or exit_on_problem("UNKNOWN: daemon has no knowledge of $device\n");
+defined($heat) or exit_on_problem("UNKNOWN: daemon has no knowledge of $device (temporary glitch?)\n");
 
-if ( $heat < $warn )
+if ( $heat eq 'UNK' )
+{
+  print "WARNING: daemon can't get reading for $device\n";
+  exit $ret_warning;
+}
+elsif ( $heat < $warn )
 {
   print "OK: Temperature is below warn treshold ($device is $heat)\n";
   exit $ret_ok;
