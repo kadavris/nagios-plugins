@@ -34,6 +34,7 @@ $#ARGV < 0 and help();
 
 my $status_code = $status_ok;
 my $status_msg = '';
+my $raid_sectors; # size in 512b sectors. used for completion calculations
 
 for my $argv ( @ARGV )
 {
@@ -74,12 +75,15 @@ sub process_array
 
   my $res; # get_file,etc output. re-usable
 
+  # now get to the business. gathering main parameters:
+  $res = get_file( $dev_name, $path . '/size' );
+  $res->[0] != 0 and return;
+
+  $raid_sectors = int( $res->[1] ); # 512 byte sectors
+
   if ( $verboseness > 4 )
   {
-    # now get to the business. gathering main parameters:
-    $res = get_file( $dev_name, $path . '/size' );
-    $res->[0] != 0 and return;
-    $status_msg .= nice_size( int( $res->[1] ) / 2 ); # 512 byte sectors
+    $status_msg .= nice_size( $raid_sectors / 2 ); # to Kb
   }
 
   $path .= '/md';
@@ -87,10 +91,11 @@ sub process_array
   $res = get_file( $dev_name, $path . '/level' );
   $res->[0] != 0 and return;
   my $level = $res->[1]; #'raid\d+'
+  $level =~ s/\D//g;
 
   if ( $verboseness > 4 )
   {
-    $status_msg .= ' ' . $level . ':';
+    $status_msg .= ' level ' . $level . ':';
   }
 
   # getting disks number
@@ -99,6 +104,17 @@ sub process_array
   my $disks = int( $res->[1] );
 
   # ---- health checks begin here ----
+  $res = check_val_list( $dev_name, $path . '/array_state', [ 'active', 'active-idle', 'clean', 'write-pending' ], [ 'resyncing', 'recovering', 'Not Started' ], [ '', 'degraded' ]);
+  if ( $res->[0] != 0 )
+  {
+    set_state( $res->[0], 'array_state: ' . $res->[1] );
+  }
+  else
+  {
+    $status_msg .= ' ' . ( $verboseness > 4 ? $res->[1] : '[OK]' ); # showing OK state too
+  }
+
+  ####
   $res = check_val_list( $dev_name, $path . '/sync_action', [ 'idle', 'check' ], [ 'resync', 'recover' ], [] );
   $res->[0] != 0 and set_state( $res->[0], 'sync_action: ' . $res->[1] );
 
@@ -116,17 +132,6 @@ sub process_array
   ####
   $res = check_val_less_than( $dev_name, $path . '/degraded', 1, 2 ); # 0/1
   $res->[0] != 0 and set_state( $res->[0], 'DEGRADED' );
-
-  ####
-  $res = check_val_list( $dev_name, $path . '/array_state', [ 'active', 'active-idle', 'clean', 'write-pending' ], [ 'resyncing', 'recovering', 'Not Started' ], [ '', 'degraded' ]);
-  if ( $res->[0] != 0 )
-  {
-    set_state( $res->[0], 'array_state: ' . $res->[1] );
-  }
-  else
-  {
-    $status_msg .= ' ' . ( $verboseness > 4 ? $res->[1] : 'OK' ); # showing OK state too
-  }
 
   ####
   $verboseness > 8 and $status_msg .= state3( $res->[0], ' ;)', ' :|', ' 8()' );
@@ -149,19 +154,76 @@ sub process_array
 
   ####
   my $disks_status = '';
+  my $failed_disks = 0; # count of failed
+  my $missing_disks = 0; # count of missing - to show which are ok
+  my @drivemap = (); # used to map rdX to /dev/sdX
 
   for my $disk ( 0..($disks - 1) )
   {
-    my( $code, $msg ) = check_disk( $dev_name, $path . '/rd' . $disk );
+    my( $code, $msg );
 
-    if ( $msg ne '' || $verboseness > 5 )
+    my $rd_path = $path . '/rd' . $disk;
+
+    $drivemap[ $disk ] = '';
+
+    if ( ! -r $rd_path )
     {
-      $disks_status .= $disk . '-' . $msg;
-      $disk < $disks -1 and $disks_status .= ', ';
+      set_state( $status_warning );
+      $disks_status .= ' ' . $disk . ' - Drive is missing/faulty!';
+      ++$missing_disks;
+    }
+    else  #link is here. checking for more stuff
+    {
+      my $l = readlink( $rd_path );
+
+      if ( defined( $l ) )
+      {
+        $l =~ s/.+?(\w\d+)$/$1/; # leave a1 from dev-sda1
+        $drivemap[ $disk ] = $l;
+      }
+
+      my( $code, $msg ) = check_disk( $dev_name, $path . '/rd' . $disk );
+
+      ++$failed_disks if $code != $status_ok;
+
+      if ( $msg ne '' || $verboseness >= 5 )
+      {
+        $disks_status .= ' ' . $disk . '(' . $drivemap[ $disk ] . ')-' . $msg;
+        $disk < $disks -1 and $disks_status .= ',';
+      }
     }
   }
 
-  $disks_status ne '' and $status_msg .= ', drives: [' . $disks_status . ']';
+  # trying to check if this is critical or not yet
+  if ( $level == 0 )
+  {
+    set_state( $status_critical, ' ! it is DEAD ! ' );
+  }
+  elsif ( $level == 1 && $failed_disks > $disks / 2 )
+  {
+    set_state( $status_critical, '! At least half of devices (' . $failed_disks . ' of ' . $disks . ') are failed !' );
+  }
+  elsif ( $level == 5 && $failed_disks >= 1 )
+  {
+    set_state( $status_critical, '! Tolerance limit is 1 failed drive !' );
+  }
+  elsif ( $level == 6 && $failed_disks >= 2 )
+  {
+    set_state( $status_critical, '! Tolerance limit is 2 failed drives !' );
+  }
+
+  $disks_status ne '' and $status_msg .= ', drives: [' . $disks_status . ' ]';
+
+  if ( $verboseness < 5 && $missing_disks > 0 ) # at least show which drives we see
+  {
+    $status_msg .= ' non-missing: ';
+    for my $d ( 0..$#drivemap )
+    {
+      next if $drivemap[ $d ] eq '';
+      $d > 0 and $status_msg .= ', ';
+      $status_msg .= $drivemap[ $d ];
+    }
+  }
 }
 
 ##########################################
@@ -170,15 +232,10 @@ sub process_array
 # out: none
 sub check_disk
 {
-  my @out = ($status_code, ''); # status code, message
+  my @out = ( $status_ok, '' ); # status code, message
   my ( $dev, $path ) = @_;
 
-  if ( ! -r $path )
-  {
-    return ( $status_critical, 'Drive ' . substr( $path, -1, 1 ) . ' is missing/faulty' );
-  }
-
-  my $res = check_val_list( $dev, $path . '/state', [ 'in_sync' ], [ '???' ], [ '???' ]  );
+  my $res = check_val_list( $dev, $path . '/state', [ 'in_sync', 'spare' ], [ '???' ], [ '???' ]  );
   $out[0] = state_max( $res->[0], $out[0] );
   $out[1] .= state3( $res->[0], $verboseness >= 5 ? $res->[1] : '', $res->[1] . '? ', $res->[1] . '! ' );
 
@@ -199,10 +256,10 @@ sub check_disk
   {
     $out[0] = state_max( $status_ok, $out[0] );
   }
-  else # some kind of number: sector?
+  else # current block of total blocks count. Don't go verbose as this percentage already should be provided
   {
     $out[0] = state_max( $status_warning, $out[0] );
-    $out[1] .= '/recovery(' . $res->[1] . ')';
+    $out[1] .= 'recovery';
   }
   #ppl_size: 0
   #offset: 262144
@@ -254,7 +311,7 @@ sub check_val_list
   my $res = get_file( $_[0], $_[1] );
   $res->[0] != 0 and return $res;
 
-  my $idx = 2; # index in args
+  my $idx = 2; # start index in our args
 
   for my $state ( ( $status_ok, $status_warning, $status_critical ) )
   {
@@ -268,7 +325,7 @@ sub check_val_list
 
   set_state( $status_unknown, ' ! Unknown state (' . $res->[1] . ') read from ' . $_[1] . ' !' );
 
-  return [ $status_unknown, '' ];
+  return [ $status_unknown, '?' . $res->[1] . '?' ];
 }
 
 ##########################################
@@ -329,8 +386,13 @@ sub state3
 sub set_state
 {
   return if $status_weight{ $status_code } >= $status_weight{ $_[0] };
+
   $status_code = $_[0];
-  $status_msg .= ' ' . $_[1];
+
+  if ( defined( $_[1] ) && $_[1] ne '' )
+  {
+    $status_msg .= ' ' . $_[1];
+  }
 }
 
 ##########################################
