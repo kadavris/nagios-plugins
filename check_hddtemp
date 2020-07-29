@@ -15,6 +15,7 @@ my $ret_ok = 0;
 my $ret_warning = 1;
 my $ret_critical = 2;
 my $ret_unknown = 3;
+my $daemon_answer = '-not queried-';
 
 my $port = 7634;
 
@@ -26,13 +27,19 @@ my $device = $ARGV[0];
 my $warn = $ARGV[1];
 my $crit = $ARGV[2];
 
+if ( -l $device ) # may be shortcut from /dev/disk/...
+{
+  $device = readlink( $device );
+  $device =~ s/.*\/([^\/]+)$/\/dev\/$1/;
+}
+
 -b $device or exit_on_problem("UNKNOWN: $device is not a block special file\n");
 $warn > $crit and exit_on_problem("UNKNOWN: WARN value may not be greater than or equal the CRIT value\n");
 
 # daemon output is as follows:
 # |dev1|dev1serial|dev1temp|C|<empty here>|dev2...
 open T, "/bin/ncat -i 1 -w 1 127.0.0.1 $port 2>/dev/null |" or exit_on_problem("UNKNOWN: ncat: $!\n");
-my $daemon_answer = <T>;
+$daemon_answer = <T>;
 close T;
 
 my %devlist;
