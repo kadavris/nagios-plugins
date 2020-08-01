@@ -1,0 +1,89 @@
+#!/bin/perl
+use strict;
+use warnings;
+# this is temperature reporting wrapper
+# for smartctl via nrpe-cron
+# repo is in github.com/kadavris
+
+my $temp_warn = 55; # set to summer mode.
+my $temp_crit = 60;
+
+if( $#ARGV == -1 )
+{
+  print "Supply disk letter or /dev/disk/ link as argument\n";
+  exit(3);
+}
+
+my $file = '/etc/nagios/nrpe.d/nrpe-cron/smartctl_sd';
+
+if ( length( $ARGV[0] ) == 1 )
+{
+  $file .= $ARGV[0];
+}
+elsif ( -l $ARGV[0] ) # link
+{
+  my $l = readlink( $ARGV[0] );
+
+  $l =~ s/.+(.)$/$1/;
+
+  $file .= $l;
+}
+
+if ( ! -r $file or ! open( T, $file ) )
+{
+  print "UNDEFINED: smartctl report open error: $ARGV[0]: $!";
+  exit(3);
+}
+
+# checking for stale data first
+my $fdate = `/usr/bin/stat -c%Y "$file"`;
+my $diff = time - $fdate;
+
+if ( $diff > 36000 )
+{ # 10 hour w/o updates
+  print "UNDEFINED: Not updated since ", `/usr/bin/date -d @$fdate`;
+  exit(3)
+}
+
+my $t;
+
+while( <T> )
+{
+  if ( /^194 Temperature_Celsius(\s+\S+){7}\s+(\d+)/ )
+  {
+    $t = $2;
+    last;
+  }
+}
+
+close T;
+
+if ( ! defined( $t ) )
+{
+  print "UNDEFINED: smartctl returned empty value";
+  exit(3);
+}
+
+$t = int($t);
+
+if ( $t >= $temp_crit )
+{
+  print "CRITICAL: Temperature is >= $temp_crit: $t";
+  exit(2);
+}
+
+if ( $t >= $temp_warn )
+{
+  print "WARNING: Temperature is >= $temp_warn: $t";
+  exit(1);
+}
+
+print "OK: Temperature is below $temp_warn: $t";
+exit(0);
+
+#ID# ATTRIBUTE_NAME          FLAG     VALUE WORST THRESH TYPE      UPDATED  WHEN_FAILED RAW_VALUE
+#194 Temperature_Celsius     0x0022   100   092   000    Old_age   Always       -       50
+#194 Temperature_Celsius     0x0022   082   079   000    Old_age   Always       -       52
+#194 Temperature_Celsius     0x0022   105   097   000    Old_age   Always       -       45
+#190 Airflow_Temperature_Cel 0x0022   048   041   040    Old_age   Always       -       52 (Min/Max 37/59)
+#194 Temperature_Celsius     0x0022   052   059   000    Old_age   Always       -       52 (0 24 0 0 0)
