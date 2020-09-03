@@ -47,31 +47,61 @@ print $status_msg, "\n";
 exit( $status_code );
 
 ##########################################
+# in: device name/UUID
+# out: (mdX, /sys/block/mdX)
+sub get_real_md_path
+{
+  my $path = $_[0];
+
+  $debug > 8 and print "get_real_md_path( $path )\n";
+
+  if ( $path =~ /\// )
+  {
+    if ( ! -d $path && ! -l $path )
+    {
+      return ( undef, undef );
+    }
+
+    my $dev_name = $path;
+    $dev_name =~ s/^.+\///;
+
+    return ( $dev_name, $path );
+  }
+
+  if ( $path =~ /^md\d+$/ )
+  {
+    # trying adding default path
+    return get_real_md_path( $vfs_base . '/' . $path );
+  }
+
+  my $l = '/dev/disk/by-uuid/' . $path;
+
+  if ( -l $l )
+  {
+    $l = readlink( $l );
+    $l =~ s/^(\.\.\/)+//;
+    return get_real_md_path( $l );
+  }
+
+  return ( undef, undef );
+}
+
+##########################################
 # main routine to stat with md array analysis
 # in: <path>
 sub process_array
 {
-  my $path = $_[0];
-  my $dev_name = $path;
+  my ( $dev_name, $path ) = get_real_md_path( $_[0] );
 
-  $debug and print "---- $path\n";
-
-  if ( $path !~ /\// )
-  {
-    $path = $vfs_base . '/' . $path;
-  }
-  else
-  {
-    $dev_name =~ s/^.+\///;
-  }
-
-  $status_msg .= $dev_name . ': ';
-
-  if ( ! -d $path )
+  if ( ! $path )
   {
     set_state( $status_unknown, ' Invalid path!' );
     return;
   }
+
+  $debug and print "---- $path\n";
+
+  $status_msg .= $dev_name . ': ';
 
   my $res; # get_file,etc output. re-usable
 
@@ -104,7 +134,12 @@ sub process_array
   my $disks = int( $res->[1] );
 
   # ---- health checks begin here ----
-  $res = check_val_list( $dev_name, $path . '/array_state', [ 'active', 'active-idle', 'clean', 'write-pending' ], [ 'resyncing', 'recovering', 'Not Started' ], [ '', 'degraded' ]);
+  $res = check_val_list( $dev_name, $path . '/array_state',
+          [ 'active', 'active-idle', 'clean', 'read-auto', 'write-pending' ],
+          [ 'resyncing', 'recovering', 'Not Started' ],
+          [ '', 'degraded' ]
+  );
+
   if ( $res->[0] != 0 )
   {
     set_state( $res->[0], 'array_state: ' . $res->[1] );
@@ -427,7 +462,7 @@ sub exit_on_problem
 sub help
 {
   print "This Nagios plugin monitors the state of several MD raids via /sys/block vfs interface\n";
-  print "Use: [-d] [-v <verboseness level 0-9>] <path1>[ <path2>...]\n\t-d - debug\n";
+  print "Use: [-d [level]] [-v <level>] <path1>[ <path2>...]\n\t-d [level] - debug\n\t-v <level> - verboseness level 0-9";
   print "You may specify device name with or without the full path\n";
   exit $status_unknown;
 }
