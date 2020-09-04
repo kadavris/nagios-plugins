@@ -10,8 +10,14 @@ my $temp_crit = 60;
 
 if( $#ARGV == -1 )
 {
-  print "Supply disk letter or /dev/disk/ link as argument\n";
+  print "Supply disk letter or /dev/disk/ link as argument 1[,warn t, crit t]\n";
   exit(3);
+}
+
+if( $#ARGV == 2 )
+{
+  $temp_warn = int( $ARGV[1] );
+  $temp_crit = int( $ARGV[2] );
 }
 
 my $file = '/etc/nagios/nrpe.d/nrpe-cron/smartctl_sd';
@@ -41,7 +47,7 @@ my $diff = time - $fdate;
 
 if ( $diff > 36000 )
 { # 10 hour w/o updates
-  print "UNDEFINED: Not updated since ", `/usr/bin/date -d @$fdate`;
+  print "UNDEFINED: Not updated since ", `/usr/bin/date -d \@$fdate`;
   exit(3)
 }
 
